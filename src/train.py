@@ -4,13 +4,13 @@ import logging
 import os
 
 import joblib
-import wandb
 import yaml
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import accuracy_score
 from sklearn.model_selection import GridSearchCV, train_test_split
 
-from src.utilities.fetch_features import fetch_features
+from src.wandb_tracking.schema import RunKinds, build_common_config
+from src.wandb_tracking.wandb_logger import WandbLogger
 
 logger = logging.getLogger("root")
 FORMAT = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
@@ -33,20 +33,52 @@ def read_config(env):
 def train(env):
 
     config = read_config(env)
-    project_name = config.get("Model").get("ProjectName")
-    model_name = config.get("Model").get("ModelName")
-    pod_name = config.get("TeamDetails").get("PodName")
+    model_cfg = config.get("Model", {}) or {}
+    team_cfg = config.get("TeamDetails", {}) or {}
+    fs_cfg = config.get("FeatureStore", {}) or {}
 
-    wandb.init(
+    project_name = model_cfg.get("ProjectName")
+    model_name = model_cfg.get("ModelName")
+    model_version = model_cfg.get("ModelVersion")
+    model_alias = model_cfg.get("ModelAlias")
+    pod_name = team_cfg.get("PodName")
+
+    run_name = f"{model_name}-{env}".strip("-") if model_name and env else "training-run"
+    registry_path = (
+        f"{pod_name}/{project_name}/{model_name}" if pod_name and project_name and model_name else None
+    )
+
+    wb = WandbLogger.init(
         entity=pod_name,
         project=project_name,
-        notes="Testing with additional parameters",
-        name="test churn model run",
+        name=run_name,
+        job_type=RunKinds.TRAINING,
+        tags=[f"env:{env}", f"model:{model_name}", f"model_version:{model_version}", f"alias:{model_alias}"],
+        config=build_common_config(
+            run_kind=RunKinds.TRAINING,
+            env=env,
+            model_name=model_name,
+            model_version=model_version,
+            model_alias=model_alias,
+            model_registry_path=registry_path,
+            dataset_name="sagemaker_feature_store",
+            dataset_version=None,
+            dataset_uri=fs_cfg.get("FeatureGroupName") or fs_cfg.get("FeatureStoreOutputPath"),
+            code_git_sha=os.getenv("GIT_SHA") or os.getenv("GIT_COMMIT") or os.getenv("CODEBUILD_RESOLVED_SOURCE_VERSION"),
+            image_uri=os.getenv("IMAGE_URI"),
+            image_digest=os.getenv("IMAGE_DIGEST"),
+            extra={
+                "feature_group_arn": fs_cfg.get("FeatureGroupName"),
+                "feature_store_output_path": fs_cfg.get("FeatureStoreOutputPath"),
+            },
+        ),
+        notes="Training run (safe W&B logging; schema-ready for inference linkage).",
     )
 
     # Helper functions to get hyperparameters and resource details
     hyperparameters = get_hyperparameters()
     get_resource_config()
+    wb.config_update({"training_hyperparameters": hyperparameters})
 
     # Load the data
     """
@@ -63,6 +95,9 @@ def train(env):
     """
     The following code will fetch the data from feature store
     """
+    # Imported lazily to keep module import lightweight (unit tests don't need boto3/sagemaker).
+    from src.utilities.fetch_features import fetch_features
+
     df = fetch_features(config["FeatureStore"])
     logger.info("Features fetched sucessfully.")
     df = df.dropna()
@@ -81,12 +116,27 @@ def train(env):
     # Evaluate Model
     test_score, train_score = evaluate_model(rf_reg, x_test, x_train, y_test, y_train)
 
-    wandb.log({"Training Score": train_score, "Test Score": test_score})
+    wb.log({"Training Score": train_score, "Test Score": test_score})
+    wb.summary_update(
+        {
+            "training_score": train_score,
+            "test_score": test_score,
+            "status": "success",
+        }
+    )
 
     # Model registry
-    register_model(rf_reg, model_name, pod_name, project_name)
+    register_model(
+        rf_reg,
+        model_name=model_name,
+        model_version=model_version,
+        model_alias=model_alias,
+        pod_name=pod_name,
+        project_name=project_name,
+        wandb_logger=wb,
+    )
 
-    wandb.run.finish()
+    wb.finish()
 
     logger.info("Model saved Wandb Registry\n")
 
@@ -127,21 +177,40 @@ def hyperparameter_tuning(hyperparameters, x_train, y_train):
     return grid_search
 
 
-def register_model(model, model_name, pod_name, project_name):
+def register_model(
+    model,
+    *,
+    model_name,
+    model_version,
+    model_alias,
+    pod_name,
+    project_name,
+    wandb_logger: WandbLogger,
+):
     joblib.dump(model, model_name)
-    # Create an artifact
-    artifact = wandb.Artifact(model_name, type="model")
-    logger.info("done wandb artifact\n")
-    # Add the model file to the artifact
-    artifact.add_file(model_name)
-    logger.info("done wandb artifact add\n")
-    # Log the artifact to the W&B run
-    arti = wandb.log_artifact(artifact)
-    arti.wait()
-    logger.info("done wandb artifact log\n")
-    # Link the artifact to the model registry
-    wandb.run.link_artifact(artifact, f"{pod_name}/{project_name}/{model_name}")
-    logger.info("done with wandb model registry\n")
+    # Log model artifact (and attach training→inference linkage metadata).
+    registry_path = (
+        f"{pod_name}/{project_name}/{model_name}" if pod_name and project_name and model_name else None
+    )
+    metadata = {
+        "model_name": model_name,
+        "model_version": model_version,
+        "model_alias": model_alias,
+        "trained_from_run_id": wandb_logger.run_id,
+        "model_registry_path": registry_path,
+    }
+
+    logged_artifact = wandb_logger.log_artifact_file(
+        artifact_name=str(model_name),
+        artifact_type="model",
+        file_path=str(model_name),
+        aliases=[a for a in [model_alias, model_version, "latest"] if a],
+        metadata=metadata,
+    )
+
+    if logged_artifact is not None and registry_path:
+        wandb_logger.link_artifact(logged_artifact, registry_path)
+        logger.info("done with wandb model registry\n")
 
 
 def get_resource_config():
