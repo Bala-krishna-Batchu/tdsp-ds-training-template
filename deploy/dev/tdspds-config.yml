@@ -1,0 +1,36 @@
+TeamDetails:
+  TeamName: tdspds
+  PodName: tdspds
+
+Model:
+  ProjectName: "Churn Prediction"
+  ModelName: ChurnModelTesting
+  ModelVersion: v1
+  ModelAlias: dev
+
+Schedule:
+  Enable: False
+  Cron: cron(45 * * 1 ? 2024)  #example expression
+
+FeatureStore:
+  FeatureGroupName: "arn:aws:sagemaker:us-east-1:521103921695:feature-group/tdspds-churn-feature-group-26-08-41-28"
+  FeatureStoreRoleARN: "arn:aws:iam::521103921695:role/tdsp-tdspds-centralized-feature-store-service-role"
+  FeatureStoreOutputPath: "s3://tdsp-data-products-dev/tdspds/feature-group/churn-project/query-results/"
+
+
+CostTags:
+  cost-layer: sagemaker-train
+  cost-misc: NA
+  cost-project: mlops-framework
+  cost-team: tdspds
+  cost-email: pooja.kangokar@toyota.com
+  app-id: APM0004570
+  app-name: Toyota Data Science Platform
+  blueprint-sources: NA
+  created-by-email: pooja.kangokar@toyota.com
+  program-name: mlops
+  cost-bu: DATA
+  cost-model: mlops
+
+ModelMonitoring:
+  Enable: false

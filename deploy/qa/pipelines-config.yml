@@ -1,0 +1,66 @@
+Training:
+  JobName: churn-model-training
+  Entrypoint: 'main_script.sh'
+  AlgorithmSpecification:
+    TrainingInputMode: File
+  OutputDataConfig:
+    S3OutputPath: s3://tdsp-ml-products-qa/tdspds/model/tdspds-churn-model-training
+  ResourceConfig:
+    InstanceCount: 1
+    InstanceType: ml.m4.xlarge
+    VolumeSizeInGB: 30
+  RetryStrategy:
+    MaximumRetryAttempts: 2
+  StoppingCondition:
+    MaxRuntimeInSeconds: 600
+  HyperParameters:
+    n_estimators: "[25, 50, 100, 150]"
+    max_depth: "[3, 6, 9]"
+    max_leaf_nodes: "[3, 6, 9]"
+  InputDataConfig:
+    - ChannelName: "train"
+      ContentType: "text/csv"
+      CompressionType: "None"
+      DataSource:
+        S3DataSource:
+          S3DataDistributionType: "FullyReplicated"
+          S3DataType: "S3Prefix"
+          S3Uri: "s3://tdsp-data-products-qa/tdspds/tdspds-mlops-sagemaker-training-sample/churn-project/data/input/train"
+    - ChannelName: "validation"
+      ContentType: "text/csv"
+      CompressionType: "None"
+      DataSource:
+        S3DataSource:
+          S3DataDistributionType: "FullyReplicated"
+          S3DataType: "S3Prefix"
+          S3Uri: "s3://tdsp-data-products-qa/tdspds/tdspds-mlops-sagemaker-training-sample/churn-project/data/input/validation"
+    - ChannelName: "test"
+      ContentType: "text/csv"
+      CompressionType: "None"
+      DataSource:
+        S3DataSource:
+          S3DataDistributionType: "FullyReplicated"
+          S3DataType: "S3Prefix"
+          S3Uri: "s3://tdsp-data-products-qa/tdspds/tdspds-mlops-sagemaker-training-sample/churn-project/data/input/test"
+
+
+Monitoring:
+  JobName: churn-monitoring
+  DataQuality:
+    Name: churn-dataquality
+    Enable: True
+    InstanceType: ml.m4.xlarge
+    InstanceCount: 1
+    SkipCheck: True
+    FailOnViolation: False
+    RegisterNewBaseline: True
+    DatasetFormat: 'csv'
+    Headers: True
+    SuppliedBaselineStatistics: ""     # statistics files
+    SuppliedBaselineConstraints: ""   # constraints file
+    BaselineDataset: s3://tdsp-data-products-qa/tdspds/tdspds-mlops-sagemaker-training-sample/churn-project/train_data_with_headers.csv
+    OutputS3Uri: s3://tdsp-data-products-qa/tdspds/tdspds-mlops-sagemaker-training-sample/churn-project/data-quality # monitoring output path
+
+
+Pipeline:
+  ExecuteOnCommit: True
