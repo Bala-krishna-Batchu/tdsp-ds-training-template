@@ -2,15 +2,23 @@ import ast
 import json
 import logging
 import os
+import time
 
 import joblib
-import wandb
 import yaml
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import accuracy_score
 from sklearn.model_selection import GridSearchCV, train_test_split
 
 from src.utilities.fetch_features import fetch_features
+from src.wandb_tracking import (
+    WandbLogger,
+    TrainingRunConfig,
+    TrainingRunSummary,
+    RunStatus,
+    get_run_tags,
+    get_model_artifact_metadata,
+)
 
 logger = logging.getLogger("root")
 FORMAT = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
@@ -30,23 +38,82 @@ def read_config(env):
     return config
 
 
+def get_git_sha() -> str:
+    """Get git SHA from environment or return empty string."""
+    # SageMaker/CI may set these
+    return os.getenv("GIT_SHA", os.getenv("CODEBUILD_RESOLVED_SOURCE_VERSION", ""))
+
+
+def get_git_branch() -> str:
+    """Get git branch from environment or return empty string."""
+    return os.getenv("GIT_BRANCH", os.getenv("CODEBUILD_SOURCE_VERSION", ""))
+
+
+def get_image_uri() -> str:
+    """Get container image URI from environment or return empty string."""
+    return os.getenv("IMAGE_URI", os.getenv("SAGEMAKER_CONTAINER_IMAGE", ""))
+
+
 def train(env):
+    start_time = time.time()
 
     config = read_config(env)
     project_name = config.get("Model").get("ProjectName")
     model_name = config.get("Model").get("ModelName")
+    model_version = config.get("Model").get("ModelVersion", "")
+    model_alias = config.get("Model").get("ModelAlias", "")
     pod_name = config.get("TeamDetails").get("PodName")
+    
+    # Feature store config
+    feature_store_config = config.get("FeatureStore", {})
+    feature_group_arn = feature_store_config.get("FeatureGroupName", "")
+    dataset_uri = feature_store_config.get("FeatureStoreOutputPath", "")
 
-    wandb.init(
+    # Build registry path
+    model_registry_path = f"{pod_name}/{project_name}/{model_name}"
+
+    # Build standardized run config
+    run_config = TrainingRunConfig(
+        env=env,
+        service_name=f"{model_name}-training",
+        model_name=model_name,
+        model_version=model_version,
+        model_alias=model_alias,
+        model_registry_path=model_registry_path,
+        pod_name=pod_name,
+        project_name=project_name,
+        code_git_sha=get_git_sha(),
+        code_git_branch=get_git_branch(),
+        image_uri=get_image_uri(),
+        feature_group_arn=feature_group_arn,
+        dataset_uri=dataset_uri,
+        training_job_name=os.getenv("TRAINING_JOB_NAME", ""),
+        training_job_arn=os.getenv("TRAINING_JOB_ARN", ""),
+    )
+
+    # Initialize W&B with safe wrapper
+    wandb_logger = WandbLogger()
+    wandb_init_success = wandb_logger.init(
         entity=pod_name,
         project=project_name,
         notes="Testing with additional parameters",
         name="test churn model run",
+        job_type="training",
+        tags=get_run_tags(env, run_config.run_kind, model_name),
     )
+
+    if wandb_init_success:
+        # Log standardized config fields
+        wandb_logger.config_update(run_config.to_dict())
 
     # Helper functions to get hyperparameters and resource details
     hyperparameters = get_hyperparameters()
     get_resource_config()
+
+    # Log hyperparameters to W&B config
+    if wandb_init_success and hyperparameters:
+        wandb_logger.config_update({"hyperparameters": hyperparameters})
+        run_config.hyperparameters_logged = True
 
     # Load the data
     """
@@ -81,14 +148,38 @@ def train(env):
     # Evaluate Model
     test_score, train_score = evaluate_model(rf_reg, x_test, x_train, y_test, y_train)
 
-    wandb.log({"Training Score": train_score, "Test Score": test_score})
+    # Log training metrics
+    wandb_logger.log({"Training Score": train_score, "Test Score": test_score})
 
-    # Model registry
-    register_model(rf_reg, model_name, pod_name, project_name)
+    # Calculate duration
+    duration_ms = int((time.time() - start_time) * 1000)
 
-    wandb.run.finish()
+    # Build summary
+    run_summary = TrainingRunSummary(
+        status=RunStatus.SUCCESS.value,
+        duration_ms=duration_ms,
+        train_score=train_score,
+        test_score=test_score,
+        best_params=grid_search.best_params_ if hasattr(grid_search, 'best_params_') else {},
+        n_train_samples=len(x_train),
+        n_test_samples=len(x_test),
+        n_features=x_train.shape[1] if hasattr(x_train, 'shape') else 0,
+    )
+    wandb_logger.summary_update(run_summary.to_dict())
 
-    logger.info("Model saved Wandb Registry\n")
+    # Model registry - pass wandb_logger for safe artifact logging
+    register_model(
+        rf_reg,
+        model_name,
+        pod_name,
+        project_name,
+        wandb_logger,
+        run_config,
+    )
+
+    wandb_logger.finish()
+
+    logger.info("Model saved to W&B Registry\n")
 
 
 def evaluate_model(rf_reg, x_test, x_train, y_test, y_train):
@@ -127,34 +218,78 @@ def hyperparameter_tuning(hyperparameters, x_train, y_train):
     return grid_search
 
 
-def register_model(model, model_name, pod_name, project_name):
+def register_model(
+    model,
+    model_name,
+    pod_name,
+    project_name,
+    wandb_logger: WandbLogger,
+    run_config: TrainingRunConfig,
+):
+    """
+    Register model to W&B with linkage metadata.
+    
+    The metadata enables inference repos to link back to this training run.
+    """
     joblib.dump(model, model_name)
-    # Create an artifact
-    artifact = wandb.Artifact(model_name, type="model")
-    logger.info("done wandb artifact\n")
+    
+    # Build artifact metadata for inference linkage
+    artifact_metadata = get_model_artifact_metadata(
+        run_config,
+        run_id=wandb_logger.run_id or "",
+    )
+    
+    # Create artifact with metadata
+    artifact = wandb_logger.create_artifact(
+        name=model_name,
+        artifact_type="model",
+        description=f"RandomForestClassifier model for {project_name}",
+        metadata=artifact_metadata,
+    )
+    
+    if artifact is None:
+        logger.warning("Failed to create W&B artifact, skipping model registration")
+        return
+    
+    logger.info("Created W&B artifact")
+    
     # Add the model file to the artifact
     artifact.add_file(model_name)
-    logger.info("done wandb artifact add\n")
+    logger.info("Added model file to artifact")
+    
     # Log the artifact to the W&B run
-    arti = wandb.log_artifact(artifact)
-    arti.wait()
-    logger.info("done wandb artifact log\n")
+    wandb_logger.log_artifact(artifact)
+    logger.info("Logged artifact to W&B")
+    
     # Link the artifact to the model registry
-    wandb.run.link_artifact(artifact, f"{pod_name}/{project_name}/{model_name}")
-    logger.info("done with wandb model registry\n")
+    registry_path = f"{pod_name}/{project_name}/{model_name}"
+    wandb_logger.link_artifact(artifact, registry_path)
+    logger.info(f"Linked artifact to registry: {registry_path}")
 
 
 def get_resource_config():
-    with open("/opt/ml/input/config/resourceconfig.json", "r") as json_file:
-        resourceconfig = json.load(json_file)
-    print(resourceconfig)
+    try:
+        with open("/opt/ml/input/config/resourceconfig.json", "r") as json_file:
+            resourceconfig = json.load(json_file)
+        print(resourceconfig)
+    except FileNotFoundError:
+        logger.warning("Resource config file not found, using defaults")
+        return {}
 
 
 def get_hyperparameters():
-    with open("/opt/ml/input/config/hyperparameters.json", "r") as json_file:
-        hyperparameters = json.load(json_file)
-        print(hyperparameters)
-    return hyperparameters
+    try:
+        with open("/opt/ml/input/config/hyperparameters.json", "r") as json_file:
+            hyperparameters = json.load(json_file)
+            print(hyperparameters)
+        return hyperparameters
+    except FileNotFoundError:
+        logger.warning("Hyperparameters config file not found, using defaults")
+        return {
+            "n_estimators": [50, 100],
+            "max_depth": [3, 6],
+            "max_leaf_nodes": [3, 6],
+        }
 
 
 if __name__ == "__main__":
