@@ -2,15 +2,21 @@ import ast
 import json
 import logging
 import os
+import time
 
 import joblib
-import wandb
 import yaml
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import accuracy_score
 from sklearn.model_selection import GridSearchCV, train_test_split
 
 from src.utilities.fetch_features import fetch_features
+from src.wandb_tracking import WandbLogger
+from src.wandb_tracking.schema import (
+    RUN_KIND_TRAINING,
+    RUN_TRACKER_SCHEMA_VERSION,
+    build_model_artifact_metadata,
+)
 
 logger = logging.getLogger("root")
 FORMAT = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
@@ -30,23 +36,52 @@ def read_config(env):
     return config
 
 
+def build_training_run_config(env, config, hyperparameters):
+    model_config = config.get("Model", {})
+    team_config = config.get("TeamDetails", {})
+    feature_config = config.get("FeatureStore", {})
+    return {
+        "run_tracker_schema_version": RUN_TRACKER_SCHEMA_VERSION,
+        "run_kind": RUN_KIND_TRAINING,
+        "env": env,
+        "project_name": model_config.get("ProjectName"),
+        "model_name": model_config.get("ModelName"),
+        "model_version": model_config.get("ModelVersion"),
+        "model_alias": model_config.get("ModelAlias"),
+        "pod_name": team_config.get("PodName"),
+        "feature_group_name": feature_config.get("FeatureGroupName"),
+        "feature_store_output_path": feature_config.get("FeatureStoreOutputPath"),
+        "hyperparameters": hyperparameters,
+    }
+
+
 def train(env):
 
+    start_time = time.monotonic()
     config = read_config(env)
-    project_name = config.get("Model").get("ProjectName")
-    model_name = config.get("Model").get("ModelName")
-    pod_name = config.get("TeamDetails").get("PodName")
+    model_config = config.get("Model", {})
+    project_name = model_config.get("ProjectName")
+    model_name = model_config.get("ModelName")
+    model_version = model_config.get("ModelVersion")
+    model_alias = model_config.get("ModelAlias")
+    pod_name = config.get("TeamDetails", {}).get("PodName")
 
-    wandb.init(
+    wandb_logger = WandbLogger.from_env(logger)
+    run_name = model_name
+    if model_name and model_version:
+        run_name = f"{model_name}-{model_version}"
+    wandb_logger.init(
         entity=pod_name,
         project=project_name,
-        notes="Testing with additional parameters",
-        name="test churn model run",
+        job_type="training",
+        name=run_name,
+        notes="Training run",
     )
 
     # Helper functions to get hyperparameters and resource details
     hyperparameters = get_hyperparameters()
     get_resource_config()
+    wandb_logger.config_update(build_training_run_config(env, config, hyperparameters))
 
     # Load the data
     """
@@ -81,12 +116,36 @@ def train(env):
     # Evaluate Model
     test_score, train_score = evaluate_model(rf_reg, x_test, x_train, y_test, y_train)
 
-    wandb.log({"Training Score": train_score, "Test Score": test_score})
+    wandb_logger.log({"Training Score": train_score, "Test Score": test_score})
+    wandb_logger.set_summary(
+        {
+            "Training Score": train_score,
+            "Test Score": test_score,
+            "status": "success",
+            "duration_ms": int((time.monotonic() - start_time) * 1000),
+        }
+    )
 
     # Model registry
-    register_model(rf_reg, model_name, pod_name, project_name)
+    model_registry_path = f"{pod_name}/{project_name}/{model_name}"
+    artifact_metadata = build_model_artifact_metadata(
+        model_name=model_name,
+        model_version=model_version,
+        model_alias=model_alias,
+        model_registry_path=model_registry_path,
+        trained_from_run_id=wandb_logger.run_id,
+        project_name=project_name,
+        pod_name=pod_name,
+    )
+    register_model(
+        rf_reg,
+        model_name,
+        model_registry_path,
+        wandb_logger,
+        artifact_metadata,
+    )
 
-    wandb.run.finish()
+    wandb_logger.finish()
 
     logger.info("Model saved Wandb Registry\n")
 
@@ -127,33 +186,30 @@ def hyperparameter_tuning(hyperparameters, x_train, y_train):
     return grid_search
 
 
-def register_model(model, model_name, pod_name, project_name):
+def register_model(model, model_name, model_registry_path, wandb_logger, artifact_metadata):
     joblib.dump(model, model_name)
-    # Create an artifact
-    artifact = wandb.Artifact(model_name, type="model")
-    logger.info("done wandb artifact\n")
-    # Add the model file to the artifact
-    artifact.add_file(model_name)
-    logger.info("done wandb artifact add\n")
-    # Log the artifact to the W&B run
-    arti = wandb.log_artifact(artifact)
-    arti.wait()
-    logger.info("done wandb artifact log\n")
-    # Link the artifact to the model registry
-    wandb.run.link_artifact(artifact, f"{pod_name}/{project_name}/{model_name}")
-    logger.info("done with wandb model registry\n")
+    logger.info("Model serialized to %s", model_name)
+    wandb_logger.log_artifact(
+        name=model_name,
+        artifact_type="model",
+        files=[model_name],
+        metadata=artifact_metadata,
+        registry_path=model_registry_path,
+    )
+    logger.info("Model artifact logged to W&B registry")
 
 
 def get_resource_config():
     with open("/opt/ml/input/config/resourceconfig.json", "r") as json_file:
         resourceconfig = json.load(json_file)
-    print(resourceconfig)
+    logger.info("Resource config = %s", resourceconfig)
+    return resourceconfig
 
 
 def get_hyperparameters():
     with open("/opt/ml/input/config/hyperparameters.json", "r") as json_file:
         hyperparameters = json.load(json_file)
-        print(hyperparameters)
+        logger.info("Hyperparameters = %s", hyperparameters)
     return hyperparameters
 
 
