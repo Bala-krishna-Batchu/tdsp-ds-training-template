@@ -4,13 +4,13 @@ import logging
 import os
 
 import joblib
-import wandb
 import yaml
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import accuracy_score
 from sklearn.model_selection import GridSearchCV, train_test_split
 
 from src.utilities.fetch_features import fetch_features
+from src.wandb_tracking import WandbLogger, build_run_config, get_linkage_metadata, RunTrackerMetrics
 
 logger = logging.getLogger("root")
 FORMAT = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
@@ -35,13 +35,32 @@ def train(env):
     config = read_config(env)
     project_name = config.get("Model").get("ProjectName")
     model_name = config.get("Model").get("ModelName")
+    model_version = config.get("Model", {}).get("ModelVersion")
+    model_alias = config.get("Model", {}).get("ModelAlias")
     pod_name = config.get("TeamDetails").get("PodName")
 
-    wandb.init(
+    # Initialize W&B Logger
+    wl = WandbLogger()
+
+    # Build standardized config
+    run_config = build_run_config(
+        run_kind="training",
+        env=env,
+        service_name=project_name,
+        model_name=model_name,
+        model_version=model_version,
+        model_alias=model_alias,
+        pod_name=pod_name,
+        project_name=project_name
+    )
+
+    wl.init(
         entity=pod_name,
         project=project_name,
+        config=run_config,
         notes="Testing with additional parameters",
         name="test churn model run",
+        job_type="training"
     )
 
     # Helper functions to get hyperparameters and resource details
@@ -81,12 +100,15 @@ def train(env):
     # Evaluate Model
     test_score, train_score = evaluate_model(rf_reg, x_test, x_train, y_test, y_train)
 
-    wandb.log({"Training Score": train_score, "Test Score": test_score})
+    wl.log({"Training Score": train_score, "Test Score": test_score})
+    
+    # Set summary status
+    wl.set_summary(RunTrackerMetrics.STATUS, "success")
 
     # Model registry
-    register_model(rf_reg, model_name, pod_name, project_name)
+    register_model(rf_reg, model_name, pod_name, project_name, wl, model_version)
 
-    wandb.run.finish()
+    wl.finish()
 
     logger.info("Model saved Wandb Registry\n")
 
@@ -127,36 +149,56 @@ def hyperparameter_tuning(hyperparameters, x_train, y_train):
     return grid_search
 
 
-def register_model(model, model_name, pod_name, project_name):
+def register_model(model, model_name, pod_name, project_name, wl, model_version=None):
     joblib.dump(model, model_name)
-    # Create an artifact
-    artifact = wandb.Artifact(model_name, type="model")
+    
+    # Prepare metadata for linkage
+    registry_path = f"{pod_name}/{project_name}/{model_name}"
+    metadata = get_linkage_metadata(
+        run_id=wl.run_id,
+        model_registry_path=registry_path,
+        model_version=model_version
+    )
+    
     logger.info("done wandb artifact\n")
-    # Add the model file to the artifact
-    artifact.add_file(model_name)
-    logger.info("done wandb artifact add\n")
+    
     # Log the artifact to the W&B run
-    arti = wandb.log_artifact(artifact)
-    arti.wait()
-    logger.info("done wandb artifact log\n")
-    # Link the artifact to the model registry
-    wandb.run.link_artifact(artifact, f"{pod_name}/{project_name}/{model_name}")
-    logger.info("done with wandb model registry\n")
+    artifact = wl.log_artifact(
+        artifact_name=model_name,
+        artifact_type="model",
+        file_path=model_name,
+        metadata=metadata
+    )
+    
+    if artifact:
+        # Link the artifact to the model registry
+        wl.link_artifact(artifact, registry_path)
+        logger.info("done with wandb model registry\n")
+    else:
+        logger.warning("Artifact not logged, skipping linkage.")
 
 
 def get_resource_config():
-    with open("/opt/ml/input/config/resourceconfig.json", "r") as json_file:
-        resourceconfig = json.load(json_file)
-    print(resourceconfig)
+    try:
+        with open("/opt/ml/input/config/resourceconfig.json", "r") as json_file:
+            resourceconfig = json.load(json_file)
+        print(resourceconfig)
+    except FileNotFoundError:
+        logger.warning("resourceconfig.json not found, skipping")
 
 
 def get_hyperparameters():
-    with open("/opt/ml/input/config/hyperparameters.json", "r") as json_file:
-        hyperparameters = json.load(json_file)
-        print(hyperparameters)
-    return hyperparameters
+    try:
+        with open("/opt/ml/input/config/hyperparameters.json", "r") as json_file:
+            hyperparameters = json.load(json_file)
+            print(hyperparameters)
+        return hyperparameters
+    except FileNotFoundError:
+        # Return default or empty if not found locally
+        logger.warning("hyperparameters.json not found, using defaults")
+        return {"n_estimators": 10}
 
 
 if __name__ == "__main__":
-    env = os.getenv("ENV")
+    env = os.getenv("ENV", "dev") # Default to dev if not set
     train(env)
