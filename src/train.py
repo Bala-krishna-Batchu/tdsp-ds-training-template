@@ -1,16 +1,7 @@
-"""
-Training script for churn prediction model.
-
-Uses W&B for experiment tracking and model registry with safe/optional logging.
-See src/wandb_tracking/schema.py for the shared run-tracker schema.
-"""
-
 import ast
 import json
 import logging
 import os
-import subprocess
-from typing import Any, Dict, Optional, Tuple
 
 import joblib
 import yaml
@@ -19,10 +10,16 @@ from sklearn.metrics import accuracy_score
 from sklearn.model_selection import GridSearchCV, train_test_split
 
 from src.utilities.fetch_features import fetch_features
-from src.wandb_tracking import (
-    WandbLogger,
-    build_training_config,
-    build_model_artifact_metadata,
+from src.utilities.wandb_utils import (
+    safe_wandb_init,
+    safe_wandb_log,
+    safe_wandb_config_update,
+    safe_wandb_summary,
+    safe_wandb_artifact,
+    safe_wandb_log_artifact,
+    safe_wandb_link_artifact,
+    safe_wandb_finish,
+    get_run_id,
 )
 
 logger = logging.getLogger("root")
@@ -34,9 +31,11 @@ TEST_SIZE = 0.5
 RANDOM_STATE = 0
 TARGET_COLUMN = "Exited"
 
+# Run-tracker schema version for cross-repo consistency
+RUN_TRACKER_SCHEMA_VERSION = "1.0.0"
 
-def read_config(env: str) -> Dict[str, Any]:
-    """Read TDSPDS configuration for the given environment."""
+
+def read_config(env):
     file_path = f"/opt/ml/code/deploy/{env}/tdspds-config.yml"
     with open(file_path, "r") as f:
         config = yaml.safe_load(f)
@@ -44,164 +43,94 @@ def read_config(env: str) -> Dict[str, Any]:
     return config
 
 
-def get_git_sha() -> Optional[str]:
-    """Get current git commit SHA, or None if not available."""
-    try:
-        result = subprocess.run(
-            ["git", "rev-parse", "HEAD"],
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-        if result.returncode == 0:
-            return result.stdout.strip()
-    except Exception:
-        pass
-    return None
+def train(env):
 
-
-def get_dataset_uri_from_pipelines_config(env: str) -> Optional[str]:
-    """Extract training data S3 URI from pipelines config."""
-    try:
-        file_path = f"/opt/ml/code/deploy/{env}/pipelines-config.yml"
-        with open(file_path, "r") as f:
-            config = yaml.safe_load(f)
-        # Get S3 URI from first input channel (train)
-        input_config = config.get("Training", {}).get("InputDataConfig", [])
-        for channel in input_config:
-            if channel.get("ChannelName") == "train":
-                return channel.get("DataSource", {}).get("S3DataSource", {}).get("S3Uri")
-    except Exception as e:
-        logger.warning(f"Could not read pipelines config: {e}")
-    return None
-
-
-def train(env: str) -> None:
-    """
-    Main training function.
-    
-    Trains a RandomForestClassifier on churn data, logs metrics and model
-    to W&B, and registers the model artifact with linkage metadata.
-    
-    Args:
-        env: Environment name (dev|qa|prod)
-    """
-    # Load configuration
     config = read_config(env)
-    project_name = config.get("Model", {}).get("ProjectName", "unknown-project")
-    model_name = config.get("Model", {}).get("ModelName", "unknown-model")
+    project_name = config.get("Model").get("ProjectName")
+    model_name = config.get("Model").get("ModelName")
     model_version = config.get("Model", {}).get("ModelVersion", "v1")
     model_alias = config.get("Model", {}).get("ModelAlias", env)
-    pod_name = config.get("TeamDetails", {}).get("PodName", "unknown-pod")
-    feature_group_arn = config.get("FeatureStore", {}).get("FeatureGroupName")
-    
-    # Get additional metadata
-    code_git_sha = get_git_sha()
-    dataset_uri = get_dataset_uri_from_pipelines_config(env)
-    hyperparameters = get_hyperparameters()
-    
-    # Build standardized W&B config
-    wandb_config = build_training_config(
-        env=env,
-        project_name=project_name,
-        model_name=model_name,
-        model_version=model_version,
-        model_alias=model_alias,
-        pod_name=pod_name,
-        dataset_uri=dataset_uri,
-        feature_group_arn=feature_group_arn,
-        hyperparameters=hyperparameters,
-        code_git_sha=code_git_sha,
-        image_uri=os.getenv("SAGEMAKER_IMAGE_URI"),
-    )
-    
-    # Initialize W&B with safe wrapper
-    with WandbLogger(
-        project=project_name,
+    pod_name = config.get("TeamDetails").get("PodName")
+
+    # Initialize W&B with safe wrapper (no-op if disabled)
+    safe_wandb_init(
         entity=pod_name,
-        name=f"{model_name}-{model_version}-{env}",
+        project=project_name,
+        notes="Testing with additional parameters",
+        name="test churn model run",
         job_type="training",
-        notes="Training churn prediction model",
-        tags=[env, model_version, model_alias] if model_alias else [env, model_version],
-        config=wandb_config,
-    ) as wb:
-        
-        # Log resource config
-        get_resource_config()
-        
-        # Fetch and prepare data
-        logger.info("Fetching features from feature store...")
-        df = fetch_features(config["FeatureStore"])
-        logger.info("Features fetched successfully.")
-        df = df.dropna()
-        x = df.drop([TARGET_COLUMN, "EventTime", "CustomRecordId"], axis=1)
-        y = df[TARGET_COLUMN]
-        
-        # Split the data
-        x_train, x_test, y_train, y_test = train_test_split(
-            x, y, test_size=TEST_SIZE, random_state=RANDOM_STATE
-        )
-        
-        # Log dataset size
-        wb.log({
-            "train_samples": len(x_train),
-            "test_samples": len(x_test),
-            "n_features": x_train.shape[1],
-        })
-        
-        # Hyperparameter tuning
-        logger.info("Starting hyperparameter tuning...")
-        grid_search = hyperparameter_tuning(hyperparameters, x_train, y_train)
-        best_params = grid_search.best_params_
-        wb.log({"best_hyperparameters": best_params})
-        
-        # Train model with best parameters
-        logger.info("Training final model...")
-        rf_reg = train_model(grid_search, x_test, x_train, y_train)
-        
-        # Evaluate model
-        test_score, train_score = evaluate_model(rf_reg, x_test, x_train, y_test, y_train)
-        
-        # Log metrics (both step metrics and summary)
-        wb.log({"Training Score": train_score, "Test Score": test_score})
-        wb.set_summary("train_score", train_score)
-        wb.set_summary("test_score", test_score)
-        wb.set_summary("best_hyperparameters", best_params)
-        wb.set_summary("status", "success")
-        
-        logger.info(f"Training Score: {train_score:.4f}, Test Score: {test_score:.4f}")
-        
-        # Register model with linkage metadata
-        register_model(
-            wb=wb,
-            model=rf_reg,
-            model_name=model_name,
-            model_version=model_version,
-            model_alias=model_alias,
-            pod_name=pod_name,
-            project_name=project_name,
-            env=env,
-            hyperparameters=best_params,
-            train_score=train_score,
-            test_score=test_score,
-        )
-        
-        logger.info("Training complete. Model saved to W&B Registry.\n")
+        tags=[env, model_version],
+    )
+
+    # Log standardized run-tracker config fields
+    safe_wandb_config_update({
+        "run_tracker_schema_version": RUN_TRACKER_SCHEMA_VERSION,
+        "run_kind": "training",
+        "env": env,
+        "model_name": model_name,
+        "model_version": model_version,
+        "model_alias": model_alias,
+        "model_registry_path": f"{pod_name}/{project_name}/{model_name}",
+    })
+
+    # Helper functions to get hyperparameters and resource details
+    hyperparameters = get_hyperparameters()
+    get_resource_config()
+
+    # Log hyperparameters to W&B config
+    safe_wandb_config_update({"hyperparameters": hyperparameters})
+
+    # Load the data
+    """
+    The following snippet will pull the data from S3
+
+    training_data_path = '/opt/ml/input/data/train'
+    validation_data_path = '/opt/ml/input/data/validation'
+    test_data_path = '/opt/ml/input/data/test'
+    df_train = pd.read_csv(os.path.join(training_data_path, 'churn_data.csv'))
+    df_validation = pd.read_csv(os.path.join(training_data_path, 'churn_data.csv'))
+    df_test = pd.read_csv(os.path.join(training_data_path, 'churn_data.csv'))
+    """
+
+    """
+    The following code will fetch the data from feature store
+    """
+    df = fetch_features(config["FeatureStore"])
+    logger.info("Features fetched sucessfully.")
+    df = df.dropna()
+    x = df.drop([TARGET_COLUMN, "EventTime", "CustomRecordId"], axis=1)
+    y = df[TARGET_COLUMN]
+
+    # Split the data
+    x_train, x_test, y_train, y_test = train_test_split(
+        x, y, test_size=TEST_SIZE, random_state=RANDOM_STATE
+    )
+
+    # Hyperparameter Tuning
+    grid_search = hyperparameter_tuning(hyperparameters, x_train, y_train)
+    # Train Model
+    rf_reg = train_model(grid_search, x_test, x_train, y_train)
+    # Evaluate Model
+    test_score, train_score = evaluate_model(rf_reg, x_test, x_train, y_test, y_train)
+
+    # Log metrics to W&B (safe wrapper)
+    safe_wandb_log({"Training Score": train_score, "Test Score": test_score})
+
+    # Set summary metrics for run-tracker table
+    safe_wandb_summary("train_score", train_score)
+    safe_wandb_summary("test_score", test_score)
+    safe_wandb_summary("status", "success")
+
+    # Model registry
+    register_model(rf_reg, model_name, pod_name, project_name, model_version, model_alias, env)
+
+    # Finish W&B run (safe wrapper)
+    safe_wandb_finish()
+
+    logger.info("Model saved Wandb Registry\n")
 
 
-def evaluate_model(
-    rf_reg: RandomForestClassifier,
-    x_test,
-    x_train,
-    y_test,
-    y_train,
-) -> Tuple[float, float]:
-    """
-    Evaluate model on train and test sets.
-    
-    Returns:
-        Tuple of (test_score, train_score)
-    """
+def evaluate_model(rf_reg, x_test, x_train, y_test, y_train):
     y_pred_train = rf_reg.predict(x_train)
     y_pred_test = rf_reg.predict(x_test)
     train_score = accuracy_score(y_train, y_pred_train)
@@ -209,25 +138,15 @@ def evaluate_model(
     return test_score, train_score
 
 
-def train_model(
-    grid_search: GridSearchCV,
-    x_test,
-    x_train,
-    y_train,
-) -> RandomForestClassifier:
-    """Train final model with best hyperparameters from grid search."""
+def train_model(grid_search, x_test, x_train, y_train):
     rf_reg = RandomForestClassifier(**(grid_search.best_params_))
     rf_reg.fit(x_train, y_train)
-    rf_reg.predict(x_test)  # Warm up prediction
+    rf_reg.predict(x_test)
     return rf_reg
 
 
-def hyperparameter_tuning(
-    hyperparameters: Dict[str, Any],
-    x_train,
-    y_train,
-) -> GridSearchCV:
-    """Perform grid search hyperparameter tuning."""
+def hyperparameter_tuning(hyperparameters, x_train, y_train):
+
     c = ast.literal_eval(str(hyperparameters))
     for k, v in c.items():
         # Convert single element strings to int if possible
@@ -247,81 +166,52 @@ def hyperparameter_tuning(
     return grid_search
 
 
-def register_model(
-    wb: WandbLogger,
-    model: RandomForestClassifier,
-    model_name: str,
-    model_version: str,
-    model_alias: str,
-    pod_name: str,
-    project_name: str,
-    env: str,
-    hyperparameters: Optional[Dict[str, Any]] = None,
-    train_score: Optional[float] = None,
-    test_score: Optional[float] = None,
-) -> None:
-    """
-    Save model and register to W&B Model Registry with linkage metadata.
-    
-    The artifact metadata includes trained_from_run_id so inference repos
-    can link back to this training run.
-    """
-    # Save model locally
+def register_model(model, model_name, pod_name, project_name, model_version, model_alias, env):
     joblib.dump(model, model_name)
-    logger.info("Model saved locally.")
-    
-    # Build artifact metadata for inference linkage
-    artifact_metadata = build_model_artifact_metadata(
-        trained_from_run_id=wb.run_id or "unknown",
-        model_version=model_version,
-        model_alias=model_alias,
-        model_registry_path=f"{pod_name}/{project_name}/{model_name}",
-        env=env,
-        hyperparameters=hyperparameters,
-        train_score=train_score,
-        test_score=test_score,
-    )
-    
-    # Create and log artifact
-    artifact = wb.create_artifact(
-        name=model_name,
-        type="model",
-        metadata=artifact_metadata,
-    )
-    
+
+    # Build artifact metadata for inference run linkage
+    artifact_metadata = {
+        "trained_from_run_id": get_run_id() or "unknown",
+        "model_version": model_version,
+        "model_alias": model_alias,
+        "model_registry_path": f"{pod_name}/{project_name}/{model_name}",
+        "trained_in_env": env,
+        "schema_version": RUN_TRACKER_SCHEMA_VERSION,
+    }
+
+    # Create artifact with safe wrapper
+    artifact = safe_wandb_artifact(model_name, type="model", metadata=artifact_metadata)
+
     if artifact:
+        # Add the model file to the artifact
         artifact.add_file(model_name)
-        logged_artifact = wb.log_artifact(artifact)
-        
-        if logged_artifact:
-            # Link to model registry
-            registry_path = f"{pod_name}/{project_name}/{model_name}"
-            wb.link_artifact(logged_artifact, registry_path)
-            logger.info(f"Model registered to: {registry_path}")
-        else:
-            logger.warning("Failed to log artifact to W&B")
+        logger.info("done wandb artifact add\n")
+
+        # Log the artifact to the W&B run
+        safe_wandb_log_artifact(artifact)
+        logger.info("done wandb artifact log\n")
+
+        # Link the artifact to the model registry
+        safe_wandb_link_artifact(artifact, f"{pod_name}/{project_name}/{model_name}")
+        logger.info("done with wandb model registry\n")
     else:
-        logger.warning("W&B disabled or failed - model saved locally only")
+        logger.info("W&B disabled - model saved locally only\n")
 
 
-def get_resource_config() -> Dict[str, Any]:
-    """Load SageMaker resource configuration."""
+def get_resource_config():
     try:
         with open("/opt/ml/input/config/resourceconfig.json", "r") as json_file:
             resourceconfig = json.load(json_file)
-        logger.info(f"Resource config: {resourceconfig}")
-        return resourceconfig
+        print(resourceconfig)
     except FileNotFoundError:
         logger.warning("Resource config not found (not running in SageMaker)")
-        return {}
 
 
-def get_hyperparameters() -> Dict[str, Any]:
-    """Load hyperparameters from SageMaker config."""
+def get_hyperparameters():
     try:
         with open("/opt/ml/input/config/hyperparameters.json", "r") as json_file:
             hyperparameters = json.load(json_file)
-            logger.info(f"Hyperparameters: {hyperparameters}")
+            print(hyperparameters)
         return hyperparameters
     except FileNotFoundError:
         logger.warning("Hyperparameters file not found, using defaults")
@@ -333,5 +223,5 @@ def get_hyperparameters() -> Dict[str, Any]:
 
 
 if __name__ == "__main__":
-    env = os.getenv("ENV", "dev")
+    env = os.getenv("ENV")
     train(env)

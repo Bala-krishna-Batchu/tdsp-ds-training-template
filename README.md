@@ -8,22 +8,9 @@ Kindly visit the confluence page for more details about the template:
 
 ---
 
-## W&B Logging and Run-Tracker Schema
+## W&B Logging
 
-This repository uses [Weights & Biases](https://wandb.ai) for experiment tracking and model registry.
-
-### Can We Implement Inference Run-Tracker Here?
-
-**No.** This is a **training-only** repository. The entrypoint (`src/main_script.sh` → `src/train.py`) only executes model training, not inference.
-
-For inference run-tracking, implement the shared schema in your:
-- **API inference repo** (online serving)
-- **Batch inference repo** (offline scoring jobs)
-
-This repo provides:
-1. **Shared logging contract** (`src/wandb_tracking/schema.py`) — copy/vendor to inference repos
-2. **Safe W&B wrapper** (`src/wandb_tracking/wandb_logger.py`) — copy/vendor to inference repos
-3. **Training run metadata** with linkage fields for inference runs to reference
+This repo uses Weights & Biases for experiment tracking and model registry.
 
 ### Environment Variables
 
@@ -33,158 +20,250 @@ This repo provides:
 | `WANDB_DISABLED` | Set to `true` to disable W&B logging | `false` |
 | `WANDB_MODE` | W&B mode: `online`, `offline`, `disabled`, `dryrun` | (auto) |
 | `WANDB_API_KEY` | W&B API key (required unless offline mode) | — |
-| `ENV` | Environment name (`dev`, `qa`, `prod`) | `dev` |
+| `ENV` | Environment name (`dev`, `qa`, `prod`) | — |
 
-### What Gets Logged (Training)
+### Safe Logging
 
-**Config fields** (for filtering in W&B UI):
-- `run_tracker_schema_version`, `run_kind` ("training")
-- `env`, `service_name`, `model_name`, `model_version`, `model_alias`
-- `model_registry_path`, `dataset_uri`, `feature_group_arn`
-- `hyperparameters`, `code_git_sha`, `image_uri`
-
-**Metrics logged**:
-- `Training Score` (training accuracy)
-- `Test Score` (test accuracy)
-- `train_samples`, `test_samples`, `n_features`
-- `best_hyperparameters`
-
-**Summary fields**:
-- `train_score`, `test_score`, `status`, `duration_ms`
-
-**Artifacts**:
-- Model file (serialized RandomForestClassifier via joblib)
-- Artifact metadata includes `trained_from_run_id` for inference linkage
-
-### Model Artifact Metadata (for Inference Linkage)
-
-The model artifact includes metadata that inference repos should use:
-
-```python
-{
-    "trained_from_run_id": "<wandb_run_id>",
-    "model_version": "v1",
-    "model_alias": "dev",
-    "model_registry_path": "tdspds/Churn Prediction/ChurnModelTesting",
-    "trained_in_env": "dev",
-    "hyperparameters": {...},
-    "train_score": 0.95,
-    "test_score": 0.92,
-    "schema_version": "1.0.0"
-}
-```
-
-Inference repos should:
-1. Load model from W&B artifact (or read metadata from artifact)
-2. Include `trained_from_run_id` and `model_registry_path` in their inference run config
-3. Use `build_inference_config()` from the schema module
+All W&B calls use safe wrappers (`src/utilities/wandb_utils.py`) that:
+- Never fail the training job due to logging errors
+- Auto-disable if `WANDB_API_KEY` is missing
+- Respect `ENABLE_WANDB=false` or `WANDB_MODE=disabled`
 
 ---
 
-## Inference Repos: How to Adopt the Schema
+## Run-Tracker Table Schema (Cross-Repo Contract)
 
-Copy `src/wandb_tracking/` to your inference repo, then:
+This section documents the **shared schema** for W&B run-tracker tables across training and inference repos.
+
+> **Architecture note**: This schema is a *contract*, not code to copy. Each repo implements its own logging following this schema. For a shared library, consider adding to `tdsp-mlops-wandb` base image.
+
+### Schema Version
+
+```
+run_tracker_schema_version: "1.0.0"
+```
+
+### Required Config Fields (`wandb.config`)
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `run_tracker_schema_version` | str | Schema version for compatibility |
+| `run_kind` | str | `"training"` or `"inference"` |
+| `env` | str | Environment: `dev`, `qa`, `prod` |
+| `model_name` | str | Model identifier |
+| `model_version` | str | Model version tag |
+
+### Recommended Config Fields
+
+| Field | Type | Used By | Description |
+|-------|------|---------|-------------|
+| `model_alias` | str | both | Model alias (dev/staging/prod) |
+| `model_registry_path` | str | both | W&B registry path |
+| `trained_from_run_id` | str | inference | Links back to training run |
+| `inference_kind` | str | inference | `"api"` or `"batch"` |
+| `endpoint` | str | api | API endpoint name |
+| `batch_id` | str | batch | Batch job identifier |
+| `dataset_uri` | str | both | S3/GCS path to data |
+| `hyperparameters` | dict | training | Hyperparameters used |
+
+### Required Summary Fields (`wandb.run.summary`)
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `status` | str | `"success"`, `"failed"`, `"partial"` |
+
+### Training Summary Fields
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `train_score` | float | Training accuracy/metric |
+| `test_score` | float | Test/validation accuracy/metric |
+
+### Inference Summary Fields (API)
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `n_requests` | int | Total requests processed |
+| `latency_ms_p50` | float | 50th percentile latency |
+| `latency_ms_p95` | float | 95th percentile latency |
+| `latency_ms_p99` | float | 99th percentile latency |
+| `error_rate` | float | Error rate (0.0-1.0) |
+
+### Inference Summary Fields (Batch)
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `n_records` | int | Total records processed |
+| `n_predictions` | int | Successful predictions |
+| `n_errors` | int | Failed records |
+
+---
+
+## What This Repo Logs
+
+### Config Fields
+- `run_tracker_schema_version`, `run_kind` ("training")
+- `env`, `model_name`, `model_version`, `model_alias`
+- `model_registry_path`, `hyperparameters`
+
+### Metrics
+- `Training Score`, `Test Score`
+
+### Summary
+- `train_score`, `test_score`, `status`
+
+### Model Artifact Metadata
+
+The model artifact includes metadata for inference run linkage:
+
+```json
+{
+  "trained_from_run_id": "<wandb_run_id>",
+  "model_version": "v1",
+  "model_alias": "dev",
+  "model_registry_path": "tdspds/Churn Prediction/ChurnModelTesting",
+  "trained_in_env": "dev",
+  "schema_version": "1.0.0"
+}
+```
+
+Inference repos should read this metadata and include `trained_from_run_id` in their run config.
+
+---
+
+## Inference Repos: Implementation Guide
+
+**Do NOT copy code from this repo.** Instead, implement the schema contract directly:
 
 ### API Inference Example
 
 ```python
-from wandb_tracking import WandbLogger, build_inference_config
+import wandb
 
-config = build_inference_config(
-    env="prod",
-    service_name="churn-api",
-    inference_kind="api",
-    model_name="ChurnModelTesting",
-    model_version="v1",
-    model_alias="prod",
-    trained_from_run_id="abc123",  # from model artifact metadata
-    model_registry_path="tdspds/Churn Prediction/ChurnModelTesting",
-    endpoint="churn-prediction-endpoint",
-)
-
-with WandbLogger(
+# Initialize with standardized config
+wandb.init(
     project="Churn Prediction",
     entity="tdspds",
     job_type="inference",
     tags=["prod", "api", "v1"],
-    config=config,
-) as wb:
-    # ... serve requests ...
-    wb.set_summary("n_requests", 1000)
-    wb.set_summary("latency_ms_p50", 45.2)
-    wb.set_summary("latency_ms_p95", 120.5)
-    wb.set_summary("error_rate", 0.001)
-    wb.set_summary("status", "success")
+    config={
+        "run_tracker_schema_version": "1.0.0",
+        "run_kind": "inference",
+        "inference_kind": "api",
+        "env": "prod",
+        "model_name": "ChurnModelTesting",
+        "model_version": "v1",
+        "trained_from_run_id": "abc123",  # from model artifact metadata
+        "endpoint": "churn-prediction-endpoint",
+    },
+)
+
+# ... serve requests ...
+
+# Log summary metrics
+wandb.run.summary["n_requests"] = 1000
+wandb.run.summary["latency_ms_p50"] = 45.2
+wandb.run.summary["latency_ms_p95"] = 120.5
+wandb.run.summary["error_rate"] = 0.001
+wandb.run.summary["status"] = "success"
+
+wandb.finish()
 ```
 
 ### Batch Inference Example
 
 ```python
-from wandb_tracking import WandbLogger, build_inference_config
+import wandb
 
-config = build_inference_config(
-    env="prod",
-    service_name="churn-batch",
-    inference_kind="batch",
-    model_name="ChurnModelTesting",
-    model_version="v1",
-    trained_from_run_id="abc123",
-    dataset_uri="s3://bucket/batch/input/20240115/",
-    batch_id="batch-20240115-001",
-)
-
-with WandbLogger(
+wandb.init(
     project="Churn Prediction",
     entity="tdspds",
     job_type="inference",
     tags=["prod", "batch", "v1"],
-    config=config,
-) as wb:
-    # ... process batch ...
-    wb.set_summary("n_records", 50000)
-    wb.set_summary("n_predictions", 49950)
-    wb.set_summary("n_errors", 50)
-    wb.set_summary("status", "success")
+    config={
+        "run_tracker_schema_version": "1.0.0",
+        "run_kind": "inference",
+        "inference_kind": "batch",
+        "env": "prod",
+        "model_name": "ChurnModelTesting",
+        "model_version": "v1",
+        "trained_from_run_id": "abc123",
+        "batch_id": "batch-20240115-001",
+        "dataset_uri": "s3://bucket/batch/input/",
+    },
+)
+
+# ... process batch ...
+
+wandb.run.summary["n_records"] = 50000
+wandb.run.summary["n_predictions"] = 49950
+wandb.run.summary["n_errors"] = 50
+wandb.run.summary["status"] = "success"
+
+wandb.finish()
+```
+
+### Safe Logging Pattern
+
+For graceful failure handling, wrap W&B calls:
+
+```python
+import os
+import logging
+
+def is_wandb_enabled():
+    if os.getenv("ENABLE_WANDB", "true").lower() == "false":
+        return False
+    if os.getenv("WANDB_DISABLED", "false").lower() == "true":
+        return False
+    if os.getenv("WANDB_MODE", "").lower() == "disabled":
+        return False
+    if not os.getenv("WANDB_API_KEY") and os.getenv("WANDB_MODE", "").lower() not in ("offline", "dryrun"):
+        return False
+    return True
+
+def safe_wandb_init(**kwargs):
+    if not is_wandb_enabled():
+        return None
+    try:
+        import wandb
+        return wandb.init(**kwargs)
+    except Exception as e:
+        logging.error(f"W&B init failed: {e}")
+        return None
 ```
 
 ---
 
 ## Creating the Run-Tracker Table in W&B
 
-### Recommended: W&B Report with Runs Table
-
 1. Go to W&B project → **Reports** → **Create Report**
 2. Add a **Runs Table** panel
-3. Filter: `job_type = "inference"` (or `"training"` for training runs)
-4. Add columns: `env`, `model_version`, `endpoint`, `batch_id`, `status`, `duration_ms`, etc.
+3. Filter by `job_type` = `"training"` or `"inference"`
+4. Add columns: `env`, `model_version`, `status`, `train_score`/`test_score` (training) or `n_requests`/`error_rate` (inference)
 5. Group by `model_name` or `env` as needed
 
-This gives you a "one row per inference run" view automatically.
-
-### Alternative: Table Artifact (Not Recommended)
-
-You could create a consolidated W&B Table artifact updated by each run, but this has race condition issues when multiple inference runs execute concurrently. Prefer the Runs Table view.
+This gives a "one row per run" view automatically.
 
 ---
 
-## Safety and PII
+## Architecture Recommendations
 
-- **No PII**: The schema logs only version identifiers, URIs, metrics, and run IDs
-- **Graceful failure**: If W&B is unavailable, logging is skipped and the job continues
-- **Offline mode**: Set `WANDB_MODE=offline` to log locally without network access
+### For Shared Schema Library
 
----
+If you need a true shared library across repos, add it to the **`tdsp-mlops-wandb` base image**:
 
-## File Structure
-
+```dockerfile
+# This repo already uses:
+FROM docker-prod.artifactory.tmna-devops.com/tdsp/tdsp-mlops-wandb:1.0.4 AS wandb
+COPY --from=wandb /opt/ml/code/src/initialize_tdspds.sh src/initialize_tdspds.sh
+COPY --from=wandb /opt/ml/code/src/initiate_wandb.py src/initiate_wandb.py
+COPY --from=wandb /opt/ml/code/src/utils src/utils
 ```
-src/
-├── train.py                    # Training entrypoint (uses WandbLogger)
-├── main_script.sh              # SageMaker entrypoint script
-├── utilities/
-│   └── fetch_features.py       # Feature store utilities
-└── wandb_tracking/             # W&B logging utilities (vendor to inference repos)
-    ├── __init__.py
-    ├── schema.py               # Shared run-tracker schema
-    └── wandb_logger.py         # Safe W&B wrapper
-```
+
+The `tdsp-mlops-wandb` image is the right place for:
+- Shared schema constants
+- Safe wrapper utilities
+- Common W&B initialization logic
+
+This ensures all repos using the base image get the same schema/utilities automatically.
