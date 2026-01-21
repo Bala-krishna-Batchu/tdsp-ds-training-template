@@ -11,5 +11,17 @@ echo $PYTHONPATH
 echo "Hello you have provided the following arguments: " "$@"
 /opt/ml/code/src/initialize_tdspds.sh
 
-python /opt/ml/code/src/train.py $*
+# Determine which training script to run based on MODEL_TYPE environment variable
+# MODEL_TYPE can be: computer_vision (cv) or tabular (default)
+MODEL_TYPE="${MODEL_TYPE:-computer_vision}"
+
+echo "Model Type: $MODEL_TYPE"
+
+if [ "$MODEL_TYPE" = "computer_vision" ] || [ "$MODEL_TYPE" = "cv" ]; then
+    echo "Running Computer Vision Model Training..."
+    python /opt/ml/code/src/train_cv.py $*
+else
+    echo "Running Tabular Model Training (Churn Prediction)..."
+    python /opt/ml/code/src/train.py $*
+fi
 #===============================================================================================================

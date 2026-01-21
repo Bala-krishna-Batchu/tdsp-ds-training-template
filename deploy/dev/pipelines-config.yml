@@ -1,52 +1,61 @@
 Training:
-  JobName: churn-model-training
+  JobName: cv-model-training
   Entrypoint: 'main_script.sh'
+  TrainingScript: 'train_cv.py'  # CV model training script
   AlgorithmSpecification:
     TrainingInputMode: File
   OutputDataConfig:
-    S3OutputPath: s3://tdsp-ml-products-dev/tdspds/model/tdspds-churn-model-training
+    S3OutputPath: s3://tdsp-ml-products-dev/tdspds/model/cv-image-classifier
   ResourceConfig:
     InstanceCount: 1
-    InstanceType: ml.m4.xlarge
-    VolumeSizeInGB: 30
+    InstanceType: ml.p3.2xlarge  # GPU instance for CV training
+    VolumeSizeInGB: 50
   RetryStrategy:
     MaximumRetryAttempts: 2
   StoppingCondition:
-    MaxRuntimeInSeconds: 600
+    MaxRuntimeInSeconds: 3600  # 1 hour for CV training
+  # CV Model Hyperparameters
   HyperParameters:
-    n_estimators: "[25, 50, 100, 150]"
-    max_depth: "[3, 6, 9]"
-    max_leaf_nodes: "[3, 6, 9]"
+    model_architecture: "resnet18"
+    pretrained: "true"
+    num_classes: "2"
+    batch_size: "32"
+    num_epochs: "10"
+    learning_rate: "0.001"
+    image_size: "224"
+    test_size: "0.2"
+    random_state: "42"
   InputDataConfig:
     - ChannelName: "train"
-      ContentType: "text/csv"
+      ContentType: "application/x-image"
       CompressionType: "None"
       DataSource:
         S3DataSource:
           S3DataDistributionType: "FullyReplicated"
           S3DataType: "S3Prefix"
-          S3Uri: "s3://tdsp-data-products-dev/tdspds/tdspds-mlops-sagemaker-training-sample/churn-project/data/input/train"
-    - ChannelName: "validation"
-      ContentType: "text/csv"
-      CompressionType: "None"
-      DataSource:
-        S3DataSource:
-          S3DataDistributionType: "FullyReplicated"
-          S3DataType: "S3Prefix"
-          S3Uri: "s3://tdsp-data-products-dev/tdspds/tdspds-mlops-sagemaker-training-sample/churn-project/data/input/validation"
+          S3Uri: "s3://tdsp-data-products-dev/tdspds/cv-model/data/train"
     - ChannelName: "test"
+      ContentType: "application/x-image"
+      CompressionType: "None"
+      DataSource:
+        S3DataSource:
+          S3DataDistributionType: "FullyReplicated"
+          S3DataType: "S3Prefix"
+          S3Uri: "s3://tdsp-data-products-dev/tdspds/cv-model/data/test"
+    - ChannelName: "metadata"
       ContentType: "text/csv"
       CompressionType: "None"
       DataSource:
         S3DataSource:
           S3DataDistributionType: "FullyReplicated"
           S3DataType: "S3Prefix"
-          S3Uri: "s3://tdsp-data-products-dev/tdspds/tdspds-mlops-sagemaker-training-sample/churn-project/data/input/test"
+          S3Uri: "s3://tdsp-data-products-dev/tdspds/cv-model/data/metadata"
 
 Monitoring:
-  JobName: churn-monitoring
+  JobName: cv-model-monitoring
+  # Data Quality Monitoring
   DataQuality:
-    Name: churn-dataquality
+    Name: cv-dataquality
     Enable: False
     InstanceType: ml.m4.xlarge
     InstanceCount: 1
@@ -55,10 +64,33 @@ Monitoring:
     RegisterNewBaseline: True
     DatasetFormat: 'csv'
     Headers: True
-    SuppliedBaselineStatistics: ""     # statistics files
-    SuppliedBaselineConstraints: ""   # constraints file
-    BaselineDataset: s3://tdsp-data-products-dev/tdspds/tdspds-mlops-sagemaker-training-sample/churn-project/train_data_with_headers.csv
-    OutputS3Uri: s3://tdsp-data-products-dev/tdspds/tdspds-mlops-sagemaker-training-sample/churn-project/data-quality # monitoring output path
+    SuppliedBaselineStatistics: ""
+    SuppliedBaselineConstraints: ""
+    BaselineDataset: s3://tdsp-data-products-dev/tdspds/cv-model/data/baseline.csv
+    OutputS3Uri: s3://tdsp-data-products-dev/tdspds/cv-model/data-quality
+
+  # Clarify Bias Monitoring Configuration
+  BiasMonitoring:
+    Enable: true
+    Name: cv-bias-monitoring
+    InstanceType: ml.m4.xlarge
+    InstanceCount: 1
+    # Schedule for automated bias monitoring (cron expression)
+    Schedule: "cron(0 0 * * ? *)"  # Daily at midnight
+    # S3 paths for Clarify artifacts
+    PredictionsPath: s3://tdsp-data-products-dev/tdspds/cv-model/clarify-artifacts/predictions.csv
+    MetadataPath: s3://tdsp-data-products-dev/tdspds/cv-model/clarify-artifacts/metadata_with_predictions.csv
+    OutputPath: s3://tdsp-ml-products-dev/tdspds/cv-model/bias-reports
+    # Baseline for drift detection
+    BaselineBiasPath: ""
+    # Alert configuration
+    AlertOnBiasThreshold: true
+    BiasThreshold: 0.1
+    SNSTopicArn: ""  # ARN for bias alert notifications
 
 Pipeline:
   ExecuteOnCommit: True
+  # Post-training steps
+  PostTraining:
+    - GenerateClarifyArtifacts: true
+    - TriggerBiasAnalysis: true
