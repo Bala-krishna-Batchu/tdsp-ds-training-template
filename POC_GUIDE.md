@@ -5,13 +5,30 @@ This guide walks you through demonstrating that your bias monitoring repo works 
 ## Overview
 
 ```
-┌─────────────────────┐     ┌─────────────────────┐     ┌─────────────────────┐
-│  STEP 1: Data       │ ──► │  STEP 2: Train      │ ──► │  STEP 3: Monitor    │
-│  (This Repo)        │     │  (This Repo)        │     │  (Your Monitoring   │
-│                     │     │                     │     │   Repo)             │
-│  100 images with    │     │  CV model outputs   │     │  Clarify detects    │
-│  intentional bias   │     │  predictions.csv    │     │  bias in results    │
-└─────────────────────┘     └─────────────────────┘     └─────────────────────┘
+┌──────────────────┐     ┌──────────────────┐     ┌──────────────────┐     ┌──────────────────┐
+│  STEP 1: Create  │ ──► │  STEP 2: Upload  │ ──► │  STEP 3: Train   │ ──► │  STEP 4: Monitor │
+│  Local Data      │     │  to S3           │     │  (SageMaker)     │     │  (Your Repo)     │
+│                  │     │                  │     │                  │     │                  │
+│  100 images      │     │  S3 bucket       │     │  CV model        │     │  Clarify         │
+│  + metadata      │     │                  │     │  predictions.csv │     │  bias report     │
+└──────────────────┘     └──────────────────┘     └──────────────────┘     └──────────────────┘
+```
+
+## Data Flow (Same as Churn Model)
+
+```
+S3 (Input)                           SageMaker                         S3 (Output)
+──────────                           ─────────                         ───────────
+s3://bucket/.../train/      ──►     /opt/ml/input/data/train/    
+s3://bucket/.../test/       ──►     /opt/ml/input/data/test/     ──►  Training
+s3://bucket/.../metadata/   ──►     /opt/ml/input/data/metadata/      
+                                                                       │
+                                                                       ▼
+                                                               s3://bucket/.../predictions.csv
+                                                                       │
+                                                                       ▼
+                                                               Your Monitoring Repo
+                                                               (Clarify Bias Analysis)
 ```
 
 ---
@@ -46,7 +63,57 @@ This bias will be **detectable by Clarify**.
 
 ---
 
-## Step 2: Train CV Model (10 minutes)
+## Step 2: Upload Data to S3 (5 minutes)
+
+```bash
+# Upload to S3 (same pattern as churn model)
+python scripts/upload_data_to_s3.py \
+    --local-dir ./data \
+    --bucket tdsp-data-products-dev \
+    --prefix tdspds/rust-detection/data
+```
+
+**S3 Structure (after upload):**
+```
+s3://tdsp-data-products-dev/tdspds/rust-detection/data/
+├── train/
+│   ├── no_rust/*.jpg
+│   └── rust/*.jpg
+├── test/
+│   ├── no_rust/*.jpg
+│   └── rust/*.jpg
+└── metadata/
+    └── metadata.csv
+```
+
+**This matches pipelines-config.yml:**
+```yaml
+InputDataConfig:
+  - ChannelName: "train"
+    S3Uri: "s3://tdsp-data-products-dev/tdspds/rust-detection/data/train"
+  - ChannelName: "test"
+    S3Uri: "s3://tdsp-data-products-dev/tdspds/rust-detection/data/test"
+  - ChannelName: "metadata"
+    S3Uri: "s3://tdsp-data-products-dev/tdspds/rust-detection/data/metadata"
+```
+
+---
+
+## Step 3: Train CV Model
+
+### Option A: Train with SageMaker (Production)
+
+SageMaker will:
+1. Download S3 data to `/opt/ml/input/data/`
+2. Run `train_cv.py`
+3. Upload results to S3
+
+```bash
+# Trigger via your CI/CD pipeline or manually
+# SageMaker reads from S3 paths in pipelines-config.yml
+```
+
+### Option B: Train Locally (For Testing)
 
 ```bash
 # Train locally (no SageMaker needed for POC)
@@ -70,7 +137,7 @@ image_path,label,environment,surface_type,prediction,ground_truth,confidence,pro
 
 ---
 
-## Step 3: Upload to S3
+## Step 4: Upload Predictions to S3 (For Monitoring Repo)
 
 ```bash
 # Upload predictions for your monitoring repo
@@ -80,7 +147,7 @@ aws s3 cp ./output/predictions_with_metadata.csv \
 
 ---
 
-## Step 4: Run Clarify (Your Monitoring Repo)
+## Step 5: Run Clarify (Your Monitoring Repo)
 
 Your monitoring repo should use these settings:
 
@@ -119,17 +186,23 @@ Clarify should detect bias like this:
 ## Quick Commands Summary
 
 ```bash
-# 1. Create data
+# 1. Create local dataset (100 images with bias)
 python scripts/prepare_minimal_poc.py --output ./data --num-images 100
 
-# 2. Train
+# 2. Upload data to S3 (same as churn model pattern)
+python scripts/upload_data_to_s3.py \
+    --local-dir ./data \
+    --bucket tdsp-data-products-dev \
+    --prefix tdspds/rust-detection/data
+
+# 3. Train locally (for testing) OR trigger SageMaker
 python scripts/train_local.py --data-dir ./data --epochs 5
 
-# 3. Upload
+# 4. Upload predictions to S3
 aws s3 cp ./output/predictions_with_metadata.csv \
     s3://tdsp-ml-products-dev/tdspds/rust-detection/predictions.csv
 
-# 4. (In your monitoring repo) Run Clarify on the S3 path
+# 5. (In your monitoring repo) Run Clarify on the S3 path
 ```
 
 ---

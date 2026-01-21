@@ -23,6 +23,24 @@ Training:
     batch_size: "32"
     num_epochs: "10"
     learning_rate: "0.001"
+  # Data is stored in S3 and SageMaker downloads it to /opt/ml/input/data/
+  # 
+  # S3 Structure:
+  #   s3://tdsp-data-products-dev/tdspds/rust-detection/data/
+  #   ├── train/
+  #   │   ├── no_rust/*.jpg
+  #   │   └── rust/*.jpg
+  #   ├── test/
+  #   │   ├── no_rust/*.jpg
+  #   │   └── rust/*.jpg
+  #   └── metadata/
+  #       └── metadata.csv
+  #
+  # SageMaker downloads to:
+  #   /opt/ml/input/data/train/     <- train_cv.py reads from here
+  #   /opt/ml/input/data/test/      <- train_cv.py reads from here
+  #   /opt/ml/input/data/metadata/  <- metadata for bias analysis
+  #
   InputDataConfig:
     - ChannelName: "train"
       ContentType: "application/x-image"
@@ -40,6 +58,14 @@ Training:
           S3DataDistributionType: "FullyReplicated"
           S3DataType: "S3Prefix"
           S3Uri: "s3://tdsp-data-products-dev/tdspds/rust-detection/data/test"
+    - ChannelName: "metadata"
+      ContentType: "text/csv"
+      CompressionType: "None"
+      DataSource:
+        S3DataSource:
+          S3DataDistributionType: "FullyReplicated"
+          S3DataType: "S3Prefix"
+          S3Uri: "s3://tdsp-data-products-dev/tdspds/rust-detection/data/metadata"
 
 Pipeline:
   ExecuteOnCommit: True
