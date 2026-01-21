@@ -3,8 +3,8 @@ TeamDetails:
   PodName: tdspds
 
 Model:
-  ProjectName: "CV Model Bias Monitoring"
-  ModelName: cv-image-classifier
+  ProjectName: "Rust Detection Bias Monitoring"
+  ModelName: rust-detection-classifier
   ModelVersion: v1
   ModelAlias: dev
   ModelType: computer_vision  # Options: computer_vision, tabular
@@ -13,27 +13,37 @@ Schedule:
   Enable: False
   Cron: cron(45 * * 1 ? 2024)  #example expression
 
-# CV Model Configuration
+# CV Model Configuration - Rust Detection
 CVModel:
   Architecture: resnet18  # Options: resnet18, resnet34, resnet50, efficientnet_b0, mobilenet_v2
   Pretrained: true
-  NumClasses: 2
+  NumClasses: 2  # Binary: rust/no_rust, or increase for severity levels
   ImageSize: 224
+  ClassNames:
+    - "no_rust"
+    - "rust"
+  # For multi-class severity detection, use:
+  # NumClasses: 4
+  # ClassNames: ["none", "light", "moderate", "severe"]
   
 # S3 Output Configuration for Clarify Integration
 S3Output:
   Bucket: tdsp-ml-products-dev
-  Prefix: tdspds/cv-model/image-classifier
-  ClarifyArtifactsPrefix: tdspds/cv-model/clarify-artifacts
+  Prefix: tdspds/rust-detection
+  ArtifactsPrefix: tdspds/rust-detection/artifacts
+  ModelPrefix: tdspds/rust-detection/model
+  HistoryPrefix: tdspds/rust-detection/history
 
 # Clarify Bias Monitoring Configuration
 ClarifyConfig:
   Enable: true
-  # Sensitive attributes for bias analysis (columns in metadata)
+  # Sensitive attributes for rust detection bias analysis
+  # (e.g., model may perform differently on different vehicle types)
   SensitiveAttributes:
-    - age_group
-    - gender
-    - ethnicity
+    - vehicle_type    # sedan, truck, suv
+    - environment     # urban, rural, coastal
+    - lighting        # day, night
+    - camera_angle    # front, side, top
   # Bias metrics to compute
   BiasMetrics:
     - DPPL   # Difference in Positive Proportions in Predicted Labels
@@ -44,8 +54,24 @@ ClarifyConfig:
     - DRR    # Difference in Rejection Rates
   # Threshold for flagging bias
   BiasThreshold: 0.1
-  # Positive label values for binary classification
+  # Positive label values (1 = rust detected)
   PositiveLabelValues: [1]
+
+# PSI (Population Stability Index) Monitoring Configuration
+PSIConfig:
+  Enable: true
+  # PSI thresholds
+  WarningThreshold: 0.1    # Moderate shift
+  CriticalThreshold: 0.25  # Significant shift - action required
+  # Number of bins for PSI calculation
+  NumBins: 10
+  # Columns to monitor for drift
+  MonitorColumns:
+    - prob_no_rust
+    - prob_rust
+    - confidence
+  # Schedule for PSI checks (for production inference data)
+  Schedule: "rate(1 day)"
 
 CostTags:
   cost-layer: sagemaker-train
