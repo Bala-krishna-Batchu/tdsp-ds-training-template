@@ -312,31 +312,80 @@ def train(env: str):
     logger.info("Starting training...")
     model, best_accuracy = train_model(model, train_loader, test_loader, num_epochs, learning_rate, device)
 
-    # Generate predictions for monitoring repo
+    # Generate predictions for metrics logging
     predictions_df = generate_predictions(model, test_loader, class_names, device)
-
-    # Save predictions locally
-    os.makedirs("/opt/ml/output", exist_ok=True)
-    predictions_path = "/opt/ml/output/predictions.csv"
-    predictions_df.to_csv(predictions_path, index=False)
 
     # Log metrics
     accuracy = accuracy_score(predictions_df["ground_truth"], predictions_df["prediction"])
     wandb.log({"test_accuracy": accuracy, "best_val_accuracy": best_accuracy})
     logger.info(f"Test Accuracy: {accuracy:.4f}")
 
-    # Upload to S3 for monitoring repo
+    # S3 config
     s3_bucket = s3_config.get("Bucket", "tdsp-ml-products-dev")
     s3_prefix = s3_config.get("Prefix", f"{pod_name}/{model_name}")
 
+    # =========================================================================
+    # OUTPUT FOR MONITORING REPO (Clarify Bias Analysis)
+    # =========================================================================
+    # Clarify needs:
+    #   1. model.tar.gz - Trained model (Clarify runs inference)
+    #   2. test_data.csv - Raw test data with image paths + ground truth labels
+    # =========================================================================
+
+    os.makedirs("/opt/ml/output", exist_ok=True)
+
+    # 1. Create model.tar.gz (SageMaker format for Clarify)
+    import tarfile
+    model_tar_path = "/opt/ml/model/model.tar.gz"
+    with tarfile.open(model_tar_path, "w:gz") as tar:
+        tar.add("/opt/ml/model/best_model.pth", arcname="model.pth")
+        # Save model config for inference
+        model_config = {
+            "architecture": architecture,
+            "num_classes": num_classes,
+            "class_names": class_names,
+        }
+        config_path = "/opt/ml/model/model_config.json"
+        with open(config_path, "w") as f:
+            json.dump(model_config, f)
+        tar.add(config_path, arcname="model_config.json")
+    
+    logger.info(f"Created model.tar.gz at {model_tar_path}")
+
+    # 2. Create test_data.csv (raw data for Clarify to run inference on)
+    #    Format: image_path, ground_truth_label
+    test_data_df = pd.DataFrame({
+        "image_path": test_images,
+        "ground_truth_label": test_labels,
+        "ground_truth_name": [class_names[l] for l in test_labels],
+    })
+    test_data_path = "/opt/ml/output/test_data.csv"
+    test_data_df.to_csv(test_data_path, index=False)
+    logger.info(f"Created test_data.csv with {len(test_data_df)} samples")
+
+    # 3. Upload to S3 for monitoring repo
+    # Model artifact
+    upload_to_s3(model_tar_path, s3_bucket, f"{s3_prefix}/model/model.tar.gz")
+    
+    # Test data (raw - Clarify runs inference)
+    upload_to_s3(test_data_path, s3_bucket, f"{s3_prefix}/test_data.csv")
+    
+    # Also save predictions (for reference/validation)
+    predictions_path = "/opt/ml/output/predictions.csv"
+    predictions_df.to_csv(predictions_path, index=False)
     upload_to_s3(predictions_path, s3_bucket, f"{s3_prefix}/predictions.csv")
-    upload_to_s3("/opt/ml/model/best_model.pth", s3_bucket, f"{s3_prefix}/model/best_model.pth")
 
     # Register model
     register_model("/opt/ml/model/best_model.pth", model_name, pod_name, project_name)
 
     wandb.finish()
-    logger.info("Training complete. Predictions saved to S3 for bias monitoring.")
+    
+    logger.info("=" * 60)
+    logger.info("TRAINING COMPLETE - OUTPUTS FOR MONITORING REPO:")
+    logger.info("=" * 60)
+    logger.info(f"Model artifact: s3://{s3_bucket}/{s3_prefix}/model/model.tar.gz")
+    logger.info(f"Test data CSV:  s3://{s3_bucket}/{s3_prefix}/test_data.csv")
+    logger.info("=" * 60)
 
 
 if __name__ == "__main__":
