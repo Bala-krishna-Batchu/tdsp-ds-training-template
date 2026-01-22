@@ -1,7 +1,7 @@
 Training:
   JobName: rust-detection-training
   Entrypoint: 'main_script.sh'
-  TrainingScript: 'train_cv.py'
+  TrainingScript: 'train.py'
   AlgorithmSpecification:
     TrainingInputMode: File
   OutputDataConfig:

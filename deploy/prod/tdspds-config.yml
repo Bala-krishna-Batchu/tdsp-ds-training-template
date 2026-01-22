@@ -3,20 +3,30 @@ TeamDetails:
   PodName: tdspds
 
 Model:
-  ProjectName: "Churn Prediction"
-  ModelName: ChurnModel
-  ModelVersion: v4
+  ProjectName: "Rust Detection"
+  ModelName: rust-detection-model
+  ModelVersion: v1
   ModelAlias: prod
+  ModelType: computer_vision
 
 Schedule:
   Enable: False
-  Cron: cron(45 * * 1 ? 2024)  #example expression
+  Cron: cron(45 * * 1 ? 2024)
 
-FeatureStore:
-  FeatureGroupName: "arn:aws:sagemaker:us-east-1:521103921695:feature-group/tdspds-churn-feature-group-26-08-41-28"
-  FeatureStoreRoleARN: "arn:aws:iam::521103921695:role/tdsp-tdspds-centralized-feature-store-service-role"
-  FeatureStoreOutputPath: "s3://tdsp-data-products-prod/tdspds/feature-group/churn-project/query-results/"
+# CV Model Configuration
+CVModel:
+  Architecture: resnet18
+  Pretrained: true
+  NumClasses: 2
+  ImageSize: 224
+  ClassNames:
+    - "no_rust"
+    - "rust"
 
+# S3 Output - Your monitoring repo reads from this path
+S3Output:
+  Bucket: tdsp-ml-products-prod
+  Prefix: tdspds/rust-detection
 
 CostTags:
   cost-layer: sagemaker-train
