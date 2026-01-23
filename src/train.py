@@ -183,7 +183,9 @@ def train_model(model, train_loader, test_loader, num_epochs, learning_rate, dev
 
         if val_acc > best_accuracy:
             best_accuracy = val_acc
+            os.makedirs("/opt/ml/model", exist_ok=True)  # Ensure directory exists
             torch.save(model.state_dict(), "/opt/ml/model/best_model.pth")
+            logger.info(f"Saved best model with accuracy: {val_acc:.2f}%")
 
     return model, best_accuracy
 
@@ -230,11 +232,20 @@ def register_model(model_path: str, model_name: str, pod_name: str, project_name
 
 def upload_to_s3(local_path: str, s3_bucket: str, s3_key: str) -> str:
     """Upload file to S3."""
-    s3 = boto3.client("s3")
-    s3.upload_file(local_path, s3_bucket, s3_key)
-    s3_uri = f"s3://{s3_bucket}/{s3_key}"
-    logger.info(f"Uploaded to {s3_uri}")
-    return s3_uri
+    try:
+        logger.info(f"Uploading {local_path} to s3://{s3_bucket}/{s3_key}")
+        logger.info(f"File exists: {os.path.exists(local_path)}")
+        if os.path.exists(local_path):
+            logger.info(f"File size: {os.path.getsize(local_path)} bytes")
+        
+        s3 = boto3.client("s3")
+        s3.upload_file(local_path, s3_bucket, s3_key)
+        s3_uri = f"s3://{s3_bucket}/{s3_key}"
+        logger.info(f"Successfully uploaded to {s3_uri}")
+        return s3_uri
+    except Exception as e:
+        logger.error(f"Failed to upload {local_path} to S3: {e}")
+        raise
 
 
 def train(env: str):
@@ -272,6 +283,17 @@ def train(env: str):
     # Load data from SageMaker paths (downloaded from S3)
     train_path = "/opt/ml/input/data/train"
     test_path = "/opt/ml/input/data/test"
+
+    # Debug: Check if data paths exist
+    logger.info(f"Checking train path: {train_path}")
+    logger.info(f"Train path exists: {os.path.exists(train_path)}")
+    if os.path.exists(train_path):
+        logger.info(f"Train path contents: {os.listdir(train_path)}")
+    
+    logger.info(f"Checking test path: {test_path}")
+    logger.info(f"Test path exists: {os.path.exists(test_path)}")
+    if os.path.exists(test_path):
+        logger.info(f"Test path contents: {os.listdir(test_path)}")
 
     train_images, train_labels, class_names = load_data_from_directory(train_path)
 
