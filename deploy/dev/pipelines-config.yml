@@ -58,14 +58,8 @@ Training:
           S3DataDistributionType: "FullyReplicated"
           S3DataType: "S3Prefix"
           S3Uri: "s3://tdsp-data-products-dev/tdspds/rust-detection/data/test"
-    - ChannelName: "metadata"
-      ContentType: "text/csv"
-      CompressionType: "None"
-      DataSource:
-        S3DataSource:
-          S3DataDistributionType: "FullyReplicated"
-          S3DataType: "S3Prefix"
-          S3Uri: "s3://tdsp-data-products-dev/tdspds/rust-detection/data/metadata"
+    # Note: metadata channel not needed for basic classification
+    # Add it later if you want bias analysis by attributes (e.g., environment, surface_type)
 
 Pipeline:
   ExecuteOnCommit: True
