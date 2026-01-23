@@ -1,64 +1,65 @@
 Training:
-  JobName: churn-model-training
+  JobName: rust-detection-training
   Entrypoint: 'main_script.sh'
+  TrainingScript: 'train.py'
   AlgorithmSpecification:
     TrainingInputMode: File
   OutputDataConfig:
-    S3OutputPath: s3://tdsp-ml-products-dev/tdspds/model/tdspds-churn-model-training
+    # This S3 path is used by your monitoring repo for Clarify analysis
+    S3OutputPath: s3://tdsp-ml-products-dev/tdspds/rust-detection
   ResourceConfig:
     InstanceCount: 1
-    InstanceType: ml.m4.xlarge
-    VolumeSizeInGB: 30
+    InstanceType: ml.p3.2xlarge  # GPU for CV training
+    VolumeSizeInGB: 50
   RetryStrategy:
     MaximumRetryAttempts: 2
   StoppingCondition:
-    MaxRuntimeInSeconds: 600
+    MaxRuntimeInSeconds: 3600
+  # CV Model Hyperparameters
   HyperParameters:
-    n_estimators: "[25, 50, 100, 150]"
-    max_depth: "[3, 6, 9]"
-    max_leaf_nodes: "[3, 6, 9]"
+    model_architecture: "resnet18"
+    pretrained: "true"
+    num_classes: "2"
+    batch_size: "32"
+    num_epochs: "10"
+    learning_rate: "0.001"
+  # Data is stored in S3 and SageMaker downloads it to /opt/ml/input/data/
+  # 
+  # S3 Structure:
+  #   s3://tdsp-data-products-dev/tdspds/rust-detection/data/
+  #   ├── train/
+  #   │   ├── no_rust/*.jpg
+  #   │   └── rust/*.jpg
+  #   ├── test/
+  #   │   ├── no_rust/*.jpg
+  #   │   └── rust/*.jpg
+  #   └── metadata/
+  #       └── metadata.csv
+  #
+  # SageMaker downloads to:
+  #   /opt/ml/input/data/train/     <- train_cv.py reads from here
+  #   /opt/ml/input/data/test/      <- train_cv.py reads from here
+  #   /opt/ml/input/data/metadata/  <- metadata for bias analysis
+  #
   InputDataConfig:
     - ChannelName: "train"
-      ContentType: "text/csv"
+      ContentType: "application/x-image"
       CompressionType: "None"
       DataSource:
         S3DataSource:
           S3DataDistributionType: "FullyReplicated"
           S3DataType: "S3Prefix"
-          S3Uri: "s3://tdsp-data-products-dev/tdspds/tdspds-mlops-sagemaker-training-sample/churn-project/data/input/train"
-    - ChannelName: "validation"
-      ContentType: "text/csv"
-      CompressionType: "None"
-      DataSource:
-        S3DataSource:
-          S3DataDistributionType: "FullyReplicated"
-          S3DataType: "S3Prefix"
-          S3Uri: "s3://tdsp-data-products-dev/tdspds/tdspds-mlops-sagemaker-training-sample/churn-project/data/input/validation"
+          S3Uri: "s3://tdsp-data-products-dev/tdspds/rust-detection/data/train"
     - ChannelName: "test"
-      ContentType: "text/csv"
+      ContentType: "application/x-image"
       CompressionType: "None"
       DataSource:
         S3DataSource:
           S3DataDistributionType: "FullyReplicated"
           S3DataType: "S3Prefix"
-          S3Uri: "s3://tdsp-data-products-dev/tdspds/tdspds-mlops-sagemaker-training-sample/churn-project/data/input/test"
-
-Monitoring:
-  JobName: churn-monitoring
-  DataQuality:
-    Name: churn-dataquality
-    Enable: False
-    InstanceType: ml.m4.xlarge
-    InstanceCount: 1
-    SkipCheck: True
-    FailOnViolation: False
-    RegisterNewBaseline: True
-    DatasetFormat: 'csv'
-    Headers: True
-    SuppliedBaselineStatistics: ""     # statistics files
-    SuppliedBaselineConstraints: ""   # constraints file
-    BaselineDataset: s3://tdsp-data-products-dev/tdspds/tdspds-mlops-sagemaker-training-sample/churn-project/train_data_with_headers.csv
-    OutputS3Uri: s3://tdsp-data-products-dev/tdspds/tdspds-mlops-sagemaker-training-sample/churn-project/data-quality # monitoring output path
+          S3Uri: "s3://tdsp-data-products-dev/tdspds/rust-detection/data/test"
+    # Note: metadata channel not needed for basic classification
+    # Add it later if you want bias analysis by attributes (e.g., environment, surface_type)
 
 Pipeline:
   ExecuteOnCommit: True

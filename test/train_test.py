@@ -1,55 +1,94 @@
+"""
+Tests for Computer Vision Model Training
+"""
+
 import os
 import sys
+import tempfile
 import unittest
 from unittest.mock import MagicMock
 
-from sklearn.ensemble import RandomForestClassifier
+import pandas as pd
+import torch
+import torch.nn as nn
+from PIL import Image
 
-# Get the absolute path of the parent directory
+# Add parent directory to path
 parent_directory = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-print(parent_directory)
-# Add the parent directory to sys.path
 sys.path.append(parent_directory)
-# Import the functions to be tested from your script
-from src.train import evaluate_model, train_model
+
+from src.train import ImageDataset, get_model, load_data_from_directory
 
 
-class TestTrainingScript(unittest.TestCase):
-    def test_evaluate_model(self):
-        # Mock data
-        rf_reg = MagicMock()
-        x_train = [[1, 2], [3, 4]]
-        x_test = [[5, 6], [7, 8]]
-        y_train = [0, 1]
-        y_test = [0, 1]
+class TestImageDataset(unittest.TestCase):
+    """Tests for ImageDataset."""
 
-        # Mock the predict method to return a list/array-like object
-        rf_reg.predict.return_value = [0, 1]  # Modify this based on your expected predictions
+    def setUp(self):
+        self.temp_dir = tempfile.mkdtemp()
+        self.image_paths = []
+        for i in range(5):
+            img_path = os.path.join(self.temp_dir, f"image_{i}.jpg")
+            img = Image.new("RGB", (100, 100), color=(i * 50, i * 50, i * 50))
+            img.save(img_path)
+            self.image_paths.append(img_path)
+        self.labels = [0, 0, 1, 1, 0]
 
-        # Call the function
-        test_score, train_score = evaluate_model(rf_reg, x_test, x_train, y_test, y_train)
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
 
-        # Check if scores are floats between 0 and 1
-        self.assertTrue(isinstance(test_score, float))
-        self.assertTrue(isinstance(train_score, float))
-        self.assertTrue(0 <= test_score <= 1)
-        self.assertTrue(0 <= train_score <= 1)
+    def test_dataset_length(self):
+        """Test dataset returns correct length."""
+        dataset = ImageDataset(self.image_paths, self.labels)
+        self.assertEqual(len(dataset), 5)
 
-    def test_train_model(self):
-        # Mock data
-        grid_search = MagicMock()
-        grid_search.best_params_ = {"n_estimators": 100, "max_depth": 10}
-        x_train = [[1, 2], [3, 4]]
-        x_test = [[5, 6], [7, 8]]
-        y_train = [0, 1]
+    def test_dataset_getitem(self):
+        """Test dataset returns correct items."""
+        dataset = ImageDataset(self.image_paths, self.labels)
+        image, label = dataset[0]
+        self.assertIsInstance(image, torch.Tensor)
+        self.assertEqual(image.shape[0], 3)  # 3 channels
+        self.assertEqual(label, 0)
 
-        # Call the function
-        rf_reg = train_model(grid_search, x_test, x_train, y_train)
 
-        # Check if rf_reg is an instance of RandomForestClassifier
-        self.assertIsInstance(rf_reg, RandomForestClassifier)
+class TestGetModel(unittest.TestCase):
+    """Tests for get_model function."""
 
-    # You can write similar tests for other functions
+    def test_resnet18(self):
+        """Test resnet18 model creation."""
+        model = get_model(num_classes=2, architecture="resnet18")
+        self.assertIsInstance(model, nn.Module)
+        self.assertEqual(model.fc.out_features, 2)
+
+    def test_resnet50(self):
+        """Test resnet50 model creation."""
+        model = get_model(num_classes=5, architecture="resnet50")
+        self.assertIsInstance(model, nn.Module)
+        self.assertEqual(model.fc.out_features, 5)
+
+
+class TestLoadDataFromDirectory(unittest.TestCase):
+    """Tests for load_data_from_directory."""
+
+    def setUp(self):
+        self.temp_dir = tempfile.mkdtemp()
+        for class_name in ["no_rust", "rust"]:
+            class_dir = os.path.join(self.temp_dir, class_name)
+            os.makedirs(class_dir)
+            for i in range(3):
+                img = Image.new("RGB", (50, 50))
+                img.save(os.path.join(class_dir, f"img_{i}.jpg"))
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+    def test_load_data(self):
+        """Test loading data from directory structure."""
+        images, labels, class_names = load_data_from_directory(self.temp_dir)
+        self.assertEqual(len(images), 6)
+        self.assertEqual(len(labels), 6)
+        self.assertEqual(class_names, ["no_rust", "rust"])
 
 
 if __name__ == "__main__":
