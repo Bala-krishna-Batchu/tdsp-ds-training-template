@@ -356,23 +356,38 @@ def train(env: str):
 
     os.makedirs("/opt/ml/output", exist_ok=True)
 
-    # 1. Create model.tar.gz (SageMaker format for Clarify)
+    # 1. Save final model (in case best_model.pth wasn't created during training)
+    os.makedirs("/opt/ml/model", exist_ok=True)
+    final_model_path = "/opt/ml/model/best_model.pth"
+    if not os.path.exists(final_model_path):
+        logger.info("No best_model.pth found, saving final model state")
+        torch.save(model.state_dict(), final_model_path)
+    
+    logger.info(f"Model file exists: {os.path.exists(final_model_path)}")
+    logger.info(f"Model file size: {os.path.getsize(final_model_path) if os.path.exists(final_model_path) else 0} bytes")
+
+    # 2. Create model.tar.gz (SageMaker format for Clarify)
     import tarfile
     model_tar_path = "/opt/ml/model/model.tar.gz"
+    
+    # Save model config for inference
+    model_config = {
+        "architecture": architecture,
+        "num_classes": num_classes,
+        "class_names": class_names,
+    }
+    config_path = "/opt/ml/model/model_config.json"
+    with open(config_path, "w") as f:
+        json.dump(model_config, f)
+    logger.info(f"Created model_config.json")
+    
+    # Create tar.gz
     with tarfile.open(model_tar_path, "w:gz") as tar:
-        tar.add("/opt/ml/model/best_model.pth", arcname="model.pth")
-        # Save model config for inference
-        model_config = {
-            "architecture": architecture,
-            "num_classes": num_classes,
-            "class_names": class_names,
-        }
-        config_path = "/opt/ml/model/model_config.json"
-        with open(config_path, "w") as f:
-            json.dump(model_config, f)
+        tar.add(final_model_path, arcname="model.pth")
         tar.add(config_path, arcname="model_config.json")
     
     logger.info(f"Created model.tar.gz at {model_tar_path}")
+    logger.info(f"model.tar.gz size: {os.path.getsize(model_tar_path)} bytes")
 
     # 2. Create test_data.csv (raw data for Clarify to run inference on)
     #    Format: image_path, ground_truth_label
